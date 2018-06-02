@@ -19,6 +19,7 @@ const renewJitter = time.Hour
 type domainRenewal struct {
 	m      *Manager
 	domain string
+	san    []string
 	key    crypto.Signer
 
 	timerMu sync.Mutex
@@ -107,7 +108,7 @@ func (dr *domainRenewal) do(ctx context.Context) (time.Duration, error) {
 		}
 	}
 
-	der, leaf, err := dr.m.authorizedCert(ctx, dr.key, dr.domain)
+	der, leaf, err := dr.m.authorizedCert(ctx, dr.key, dr.domain, dr.san...)
 	if err != nil {
 		return 0, err
 	}

@@ -248,6 +248,89 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	return cert, nil
 }
 
+// GetCertificateSAN implements the tls.Config.GetCertificate hook.
+// It provides a TLS certificate for hello.ServerName host, including answering
+// *.acme.invalid (TLS-SNI) challenges. All other fields of hello are ignored.
+//
+// If m.HostPolicy is non-nil, GetCertificate calls the policy before requesting
+// a new cert. A non-nil error returned from m.HostPolicy halts TLS negotiation.
+// The error is propagated back to the caller of GetCertificate and is user-visible.
+// This does not affect cached certs. See HostPolicy field description for more details.
+func (m *Manager) GetCertificateSAN(hello *tls.ClientHelloInfo, san ...string) (*tls.Certificate, error) {
+	if m.Prompt == nil {
+		return nil, errors.New("acme/autocert: Manager.Prompt not set")
+	}
+
+	name := hello.ServerName
+	if name == "" {
+		return nil, errors.New("acme/autocert: missing server name")
+	}
+	if !strings.Contains(strings.Trim(name, "."), ".") {
+		return nil, errors.New("acme/autocert: server name component count invalid")
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return nil, errors.New("acme/autocert: server name contains invalid character")
+	}
+
+	// In the worst-case scenario, the timeout needs to account for caching, host policy,
+	// domain ownership verification and certificate issuance.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// check whether this is a token cert requested for TLS-SNI challenge
+	if strings.HasSuffix(name, ".acme.invalid") {
+		m.tokensMu.RLock()
+		defer m.tokensMu.RUnlock()
+		if cert := m.certTokens[name]; cert != nil {
+			return cert, nil
+		}
+		if cert, err := m.cacheGet(ctx, name); err == nil {
+			return cert, nil
+		}
+		// TODO: cache error results?
+		return nil, fmt.Errorf("acme/autocert: no token cert for %q", name)
+	}
+
+	// regular domain
+
+	if len(san) > 0 {
+		for _, sa := range san {
+			if sa == "" {
+				return nil, errors.New("acme/autocert: missing server name")
+			}
+			if !strings.Contains(strings.Trim(sa, "."), ".") {
+				return nil, errors.New("acme/autocert: server name component count invalid")
+			}
+			if strings.ContainsAny(sa, `/\`) {
+				return nil, errors.New("acme/autocert: server name contains invalid character")
+			}
+			sa = strings.TrimSuffix(sa, ".") // golang.org/issue/18114
+		}
+		name, san = san[0], san[1:]
+	} else {
+		name = strings.TrimSuffix(name, ".") // golang.org/issue/18114
+	}
+
+	cert, err := m.cert(ctx, name, san...)
+	if err == nil {
+		return cert, nil
+	}
+	if err != ErrCacheMiss {
+		return nil, err
+	}
+
+	// first-time
+	if err := m.hostPolicy()(ctx, name); err != nil {
+		return nil, err
+	}
+	cert, err = m.createCert(ctx, name, san...)
+	if err != nil {
+		return nil, err
+	}
+	m.cachePut(ctx, name, cert)
+	return cert, nil
+}
+
 // HTTPHandler configures the Manager to provision ACME "http-01" challenge responses.
 // It returns an http.Handler that responds to the challenges and must be
 // running on port 80. If it receives a request that is not an ACME challenge,
@@ -293,6 +376,14 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 	})
 }
 
+// SetTryHTTP01 allow to enable/disable "http-01" challenge validation from
+// custom packages
+func (m *Manager) SetTryHTTP01(v bool) {
+	m.tokensMu.Lock()
+	defer m.tokensMu.Unlock()
+	m.tryHTTP01 = v
+}
+
 func handleHTTPRedirect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" && r.Method != "HEAD" {
 		http.Error(w, "Use HTTPS", http.StatusBadRequest)
@@ -313,7 +404,7 @@ func stripPort(hostport string) string {
 // cert returns an existing certificate either from m.state or cache.
 // If a certificate is found in cache but not in m.state, the latter will be filled
 // with the cached value.
-func (m *Manager) cert(ctx context.Context, name string) (*tls.Certificate, error) {
+func (m *Manager) cert(ctx context.Context, name string, san ...string) (*tls.Certificate, error) {
 	m.stateMu.Lock()
 	if s, ok := m.state[name]; ok {
 		m.stateMu.Unlock()
@@ -339,7 +430,7 @@ func (m *Manager) cert(ctx context.Context, name string) (*tls.Certificate, erro
 		leaf: cert.Leaf,
 	}
 	m.state[name] = s
-	go m.renew(name, s.key, s.leaf.NotAfter)
+	go m.renew(name, s.key, s.leaf.NotAfter, san...)
 	return cert, nil
 }
 
@@ -441,7 +532,7 @@ func encodeECDSAKey(w io.Writer, key *ecdsa.PrivateKey) error {
 //
 // If the domain is already being verified, it waits for the existing verification to complete.
 // Either way, createCert blocks for the duration of the whole process.
-func (m *Manager) createCert(ctx context.Context, domain string) (*tls.Certificate, error) {
+func (m *Manager) createCert(ctx context.Context, domain string, san ...string) (*tls.Certificate, error) {
 	// TODO: maybe rewrite this whole piece using sync.Once
 	state, err := m.certState(domain)
 	if err != nil {
@@ -461,7 +552,7 @@ func (m *Manager) createCert(ctx context.Context, domain string) (*tls.Certifica
 	defer state.Unlock()
 	state.locked = false
 
-	der, leaf, err := m.authorizedCert(ctx, state.key, domain)
+	der, leaf, err := m.authorizedCert(ctx, state.key, domain, san...)
 	if err != nil {
 		// Remove the failed state after some time,
 		// making the manager call createCert again on the following TLS hello.
@@ -527,7 +618,7 @@ func (m *Manager) certState(domain string) (*certState, error) {
 
 // authorizedCert starts the domain ownership verification process and requests a new cert upon success.
 // The key argument is the certificate private key.
-func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain string) (der [][]byte, leaf *x509.Certificate, err error) {
+func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain string, san ...string) (der [][]byte, leaf *x509.Certificate, err error) {
 	client, err := m.acmeClient(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -536,7 +627,16 @@ func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain 
 	if err := m.verify(ctx, client, domain); err != nil {
 		return nil, nil, err
 	}
-	csr, err := certRequest(key, domain, m.ExtraExtensions)
+
+	if len(san) > 0 {
+		for _, sa := range san {
+			if err := m.verify(ctx, client, sa); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
+	csr, err := certRequest(key, domain, m.ExtraExtensions, san...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -755,7 +855,7 @@ func httpTokenCacheKey(tokenPath string) string {
 //
 // The key argument is a certificate private key.
 // The exp argument is the cert expiration time (NotAfter).
-func (m *Manager) renew(domain string, key crypto.Signer, exp time.Time) {
+func (m *Manager) renew(domain string, key crypto.Signer, exp time.Time, san ...string) {
 	m.renewalMu.Lock()
 	defer m.renewalMu.Unlock()
 	if m.renewal[domain] != nil {
@@ -765,7 +865,7 @@ func (m *Manager) renew(domain string, key crypto.Signer, exp time.Time) {
 	if m.renewal == nil {
 		m.renewal = make(map[string]*domainRenewal)
 	}
-	dr := &domainRenewal{m: m, domain: domain, key: key}
+	dr := &domainRenewal{m: m, domain: domain, key: key, san: san}
 	m.renewal[domain] = dr
 	dr.start(exp)
 }
